@@ -2,6 +2,9 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const sqlite3 = require("sqlite3").verbose();
+const BOOTSTRAP_SUPERADMIN_LINE_ID =
+  process.env.BOOTSTRAP_SUPERADMIN_LINE_ID || "";
+
 
 const app = express();
 
@@ -120,6 +123,28 @@ db.serialize(() => {
 });
 
 // ====== Helpers ======
+
+function bootstrapSuperAdmin(lineUserId) {
+  if (!BOOTSTRAP_SUPERADMIN_LINE_ID) return;
+  if (lineUserId !== BOOTSTRAP_SUPERADMIN_LINE_ID) return;
+
+  db.run(
+    `
+    UPDATE users
+    SET role='SUPERADMIN', updated_at=?
+    WHERE line_user_id=? AND role!='SUPERADMIN'
+    `,
+    [nowISO(), lineUserId],
+    (err) => {
+      if (err) {
+        console.error("❌ bootstrap SUPERADMIN error:", err.message);
+      } else {
+        console.log("👑 SUPERADMIN ensured for", lineUserId);
+      }
+    }
+  );
+}
+
 function nowISO() {
   return new Date().toISOString();
 }
@@ -165,11 +190,33 @@ function requireAdmin(req, res, next) {
     (err, row) => {
       if (err) return res.status(500).json({ error: err.message });
       if (!row) return res.status(401).json({ error: "user not found" });
-      if (row.role !== "ADMIN") return res.status(403).json({ error: "admin only" });
+      if (row.role !== "ADMIN" && row.role !== "SUPERADMIN") {
+        return res.status(403).json({ error: "admin only" });
+      }
       next();
     }
   );
 }
+
+function requireSuperAdmin(req, res, next) {
+  db.get(
+    "SELECT role FROM users WHERE line_user_id = ?",
+    [req.user.lineUserId],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!row) return res.status(401).json({ error: "user not found" });
+      if (row.role !== "SUPERADMIN") {
+        return res.status(403).json({ error: "superadmin only" });
+      }
+      next();
+    }
+  );
+}
+
+// หลัง insert/update user สำเร็จ
+bootstrapSuperAdmin(lineUserId);
+
+
 
 // ====== Routes ======
 app.get("/", (req, res) => res.send("OK"));
@@ -331,6 +378,8 @@ app.post("/bookings", auth, (req, res) => {
   );
 });
 
+
+
 // ====== Admin Dashboard APIs ======
 
 // 6) List pending bookings
@@ -411,6 +460,49 @@ app.post("/admin/bookings/:id/reject", auth, requireAdmin, (req, res) => {
     }
   );
 });
+
+// ====== Super Admin: User management ======
+
+// list users (สำหรับตั้ง role)
+app.get("/admin/users", auth, requireSuperAdmin, (req, res) => {
+  const q = (req.query.q || "").trim();
+
+  const baseSql = `
+    SELECT id, line_user_id, display_name, first_name, last_name, department, role, profile_completed, updated_at
+    FROM users
+  `;
+
+  const sql = q
+    ? baseSql + ` WHERE display_name LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR department LIKE ? ORDER BY updated_at DESC LIMIT 200`
+    : baseSql + ` ORDER BY updated_at DESC LIMIT 200`;
+
+  const params = q ? Array(4).fill(`%${q}%`) : [];
+
+  db.all(sql, params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    return res.json({ users: rows });
+  });
+});
+
+// set role ให้ user คนอื่น
+app.post("/admin/users/:id/role", auth, requireSuperAdmin, (req, res) => {
+  const userId = Number(req.params.id);
+  const role = (req.body.role || "").toUpperCase();
+
+  const allowed = new Set(["USER", "ADMIN", "SUPERADMIN"]);
+  if (!allowed.has(role)) return res.status(400).json({ error: "invalid role" });
+
+  db.run(
+    `UPDATE users SET role=?, updated_at=? WHERE id=?`,
+    [role, nowISO(), userId],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(404).json({ error: "user not found" });
+      return res.json({ ok: true, role });
+    }
+  );
+});
+
 
 // ✅ listen แค่ครั้งเดียว
 app.listen(PORT, () => {
