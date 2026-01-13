@@ -7,9 +7,7 @@ const app = express();
 
 // ====== CONFIG ======
 const APP_JWT_SECRET = process.env.APP_JWT_SECRET || "change-me";
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log("API running on http://localhost:" + PORT));
-
+const PORT = Number(process.env.PORT) || 3000;
 
 // LINE Channel ID (ถ้าใส่ไว้จะเช็ค aud ให้)
 const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID || "";
@@ -85,13 +83,14 @@ db.serialize(() => {
 
   // seed รถตัวอย่าง (ครั้งเดียว)
   db.get("SELECT COUNT(*) as c FROM cars", (err, row) => {
-    if (!err && row.c === 0) {
+    if (!err && row && row.c === 0) {
       const stmt = db.prepare(
         "INSERT INTO cars (name, plate, seats, image_url) VALUES (?,?,?,?)"
       );
       stmt.run("Toyota Vios", "กข-1234", 4, "https://picsum.photos/seed/vios/600/400");
       stmt.run("Isuzu D-Max", "ขค-5678", 2, "https://picsum.photos/seed/dmax/600/400");
       stmt.finalize();
+      console.log("✅ Seed cars inserted");
     }
   });
 });
@@ -132,6 +131,7 @@ function auth(req, res, next) {
 
 // ====== Routes ======
 app.get("/", (req, res) => res.send("OK"));
+app.get("/health", (req, res) => res.json({ ok: true, time: nowISO() }));
 
 // 1) Auth with LINE idToken
 app.post("/auth/line", (req, res) => {
@@ -141,9 +141,7 @@ app.post("/auth/line", (req, res) => {
 
     const payload = decodeIdTokenUnsafe(idToken);
 
-    // debug log ช่วยมากเวลาไล่ปัญหา
-    console.log("[/auth/line] payload.sub:", payload.sub);
-    console.log("[/auth/line] payload.aud:", payload.aud);
+    console.log("[/auth/line] sub:", payload.sub, "aud:", payload.aud);
 
     // basic checks (ขั้นต่ำ)
     if (!payload.sub) return res.status(400).json({ error: "token missing sub" });
@@ -228,4 +226,7 @@ app.post("/bookings", auth, (req, res) => {
   });
 });
 
-app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
+// ✅ listen แค่ครั้งเดียว (สำคัญ)
+app.listen(PORT, () => {
+  console.log(`✅ API running on port ${PORT}`);
+});
