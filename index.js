@@ -2,16 +2,15 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const sqlite3 = require("sqlite3").verbose();
+
 const BOOTSTRAP_SUPERADMIN_LINE_ID =
   process.env.BOOTSTRAP_SUPERADMIN_LINE_ID || "";
-
 
 const app = express();
 
 // ====== CONFIG ======
 const APP_JWT_SECRET = process.env.APP_JWT_SECRET || "change-me";
 const PORT = Number(process.env.PORT) || 10000; // Render ใช้ env PORT
-
 const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID || "";
 
 // Render แนะนำเขียนลง /tmp ถ้าไม่มี persistent disk
@@ -23,6 +22,41 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// ✅ Department allowlist (ตามที่คุณให้มา)
+const DEPARTMENTS = [
+  "ENGINEER",
+  "ACCOUNT",
+  "HUMAN_RESOURCES",
+  "SALES",
+  "PUBLIC_RELATIONS",
+  "PURCHASING",
+  "EXECUTIVE_GROUP",
+];
+
+function normalizeDepartment(input) {
+  const v = String(input || "").trim();
+  if (!v) return "";
+  const upper = v.toUpperCase();
+
+  // รองรับกรณีพิมพ์ชื่อสวย ๆ เข้ามา (เผื่อ frontend ส่ง label)
+  const map = new Map([
+    ["ENGINEER", "ENGINEER"],
+    ["ACCOUNT", "ACCOUNT"],
+    ["HUMAN RESOURCES", "HUMAN_RESOURCES"],
+    ["HUMAN_RESOURCES", "HUMAN_RESOURCES"],
+    ["HR", "HUMAN_RESOURCES"],
+    ["SALES", "SALES"],
+    ["PUBLIC RELATIONS", "PUBLIC_RELATIONS"],
+    ["PUBLIC_RELATIONS", "PUBLIC_RELATIONS"],
+    ["PR", "PUBLIC_RELATIONS"],
+    ["PURCHASING", "PURCHASING"],
+    ["EXECUTIVE GROUP", "EXECUTIVE_GROUP"],
+    ["EXECUTIVE_GROUP", "EXECUTIVE_GROUP"],
+  ]);
+
+  return map.get(upper) || upper;
+}
+
 // ====== MIDDLEWARE ======
 app.use(express.json());
 
@@ -30,15 +64,9 @@ app.use(express.json());
 app.use(
   cors({
     origin: function (origin, callback) {
-      // curl/postman ไม่มี origin
       if (!origin) return callback(null, true);
-
-      // dev: ถ้าไม่กำหนด allowlist ให้ผ่านหมด
       if (ALLOWED_ORIGINS.length === 0) return callback(null, true);
-
       if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-
-      // ถ้าไม่อยู่ใน allowlist ให้ตอบ error
       return callback(new Error(`CORS blocked for origin: ${origin}`));
     },
     credentials: true,
@@ -46,8 +74,6 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-
-// preflight
 app.options("*", cors());
 
 // ====== DB ======
@@ -123,30 +149,24 @@ db.serialize(() => {
 });
 
 // ====== Helpers ======
+function nowISO() {
+  return new Date().toISOString();
+}
 
 function bootstrapSuperAdmin(lineUserId) {
   if (!BOOTSTRAP_SUPERADMIN_LINE_ID) return;
   if (lineUserId !== BOOTSTRAP_SUPERADMIN_LINE_ID) return;
 
   db.run(
-    `
-    UPDATE users
-    SET role='SUPERADMIN', updated_at=?
-    WHERE line_user_id=? AND role!='SUPERADMIN'
-    `,
+    `UPDATE users
+     SET role='SUPERADMIN', updated_at=?
+     WHERE line_user_id=? AND role!='SUPERADMIN'`,
     [nowISO(), lineUserId],
     (err) => {
-      if (err) {
-        console.error("❌ bootstrap SUPERADMIN error:", err.message);
-      } else {
-        console.log("👑 SUPERADMIN ensured for", lineUserId);
-      }
+      if (err) console.error("❌ bootstrap SUPERADMIN error:", err.message);
+      else console.log("👑 SUPERADMIN ensured for", lineUserId);
     }
   );
-}
-
-function nowISO() {
-  return new Date().toISOString();
 }
 
 // base64url decode ให้ถูก + padding
@@ -213,11 +233,6 @@ function requireSuperAdmin(req, res, next) {
   );
 }
 
-// หลัง insert/update user สำเร็จ
-bootstrapSuperAdmin(lineUserId);
-
-
-
 // ====== Routes ======
 app.get("/", (req, res) => res.send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true, time: nowISO() }));
@@ -247,24 +262,24 @@ app.post("/auth/line", (req, res) => {
        ON CONFLICT(line_user_id) DO UPDATE SET
          display_name=excluded.display_name,
          picture_url=excluded.picture_url,
-         updated_at=excluded.updated_at
-      `,
+         updated_at=excluded.updated_at`,
       [lineUserId, displayName, pictureUrl, nowISO()],
       (err) => {
         if (err) return res.status(500).json({ error: err.message });
 
+        // ✅ bootstrap SUPERADMIN ตรงนี้เท่านั้น (หลังรู้ lineUserId แน่นอน)
+        bootstrapSuperAdmin(lineUserId);
+
         db.get(
-          `SELECT line_user_id, display_name, picture_url, first_name, last_name, department, role, profile_completed
+          `SELECT line_user_id, display_name, picture_url,
+                  first_name, last_name, department, role, profile_completed
            FROM users WHERE line_user_id = ?`,
           [lineUserId],
           (err2, userRow) => {
             if (err2) return res.status(500).json({ error: err2.message });
 
             const appToken = signAppToken(lineUserId);
-            return res.json({
-              appToken,
-              user: userRow,
-            });
+            return res.json({ appToken, user: userRow });
           }
         );
       }
@@ -278,23 +293,35 @@ app.post("/auth/line", (req, res) => {
 // 2) Get my profile
 app.get("/me", auth, (req, res) => {
   db.get(
-    `SELECT line_user_id, display_name, picture_url, first_name, last_name, department, role, profile_completed
+    `SELECT line_user_id, display_name, picture_url,
+            first_name, last_name, department, role, profile_completed
      FROM users WHERE line_user_id = ?`,
     [req.user.lineUserId],
     (err, row) => {
       if (err) return res.status(500).json({ error: err.message });
       if (!row) return res.status(404).json({ error: "user not found" });
-      return res.json({ user: row });
+      return res.json({ user: row, departments: DEPARTMENTS });
     }
   );
 });
 
 // 3) Register / update profile
 app.post("/me/profile", auth, (req, res) => {
-  const { first_name, last_name, department } = req.body;
+  const first_name = String(req.body.first_name || "").trim();
+  const last_name = String(req.body.last_name || "").trim();
+  const department = normalizeDepartment(req.body.department);
 
   if (!first_name || !last_name || !department) {
-    return res.status(400).json({ error: "first_name, last_name, department required" });
+    return res
+      .status(400)
+      .json({ error: "first_name, last_name, department required" });
+  }
+
+  if (!DEPARTMENTS.includes(department)) {
+    return res.status(400).json({
+      error: "invalid department",
+      allowed: DEPARTMENTS,
+    });
   }
 
   db.run(
@@ -304,12 +331,13 @@ app.post("/me/profile", auth, (req, res) => {
     [first_name, last_name, department, nowISO(), req.user.lineUserId],
     function (err) {
       if (err) return res.status(500).json({ error: err.message });
-      return res.json({ ok: true });
+      if (this.changes === 0) return res.status(404).json({ error: "user not found" });
+      return res.json({ ok: true, department });
     }
   );
 });
 
-// 4) Available cars (ตามช่วงเวลา)
+// 4) Available cars
 app.get("/cars/available", auth, (req, res) => {
   const { startAt, endAt } = req.query;
   if (!startAt || !endAt) return res.status(400).json({ error: "startAt & endAt required" });
@@ -333,7 +361,7 @@ app.get("/cars/available", auth, (req, res) => {
   });
 });
 
-// 5) Create booking (มี check overlap + require profile)
+// 5) Create booking
 app.post("/bookings", auth, (req, res) => {
   const { carId, startAt, endAt, purpose } = req.body;
   if (!carId || !startAt || !endAt) {
@@ -351,7 +379,6 @@ app.post("/bookings", auth, (req, res) => {
         return res.status(403).json({ error: "profile not completed" });
       }
 
-      // กันจองซ้อน
       db.get(
         `SELECT id FROM bookings
          WHERE car_id=?
@@ -378,13 +405,11 @@ app.post("/bookings", auth, (req, res) => {
   );
 });
 
-
-
 // ====== Admin Dashboard APIs ======
 
 // 6) List pending bookings
 app.get("/admin/bookings", auth, requireAdmin, (req, res) => {
-  const status = req.query.status || "PENDING_APPROVAL";
+  const status = (req.query.status || "PENDING_APPROVAL").toUpperCase();
 
   const sql = `
     SELECT
@@ -410,7 +435,6 @@ app.post("/admin/bookings/:id/approve", auth, requireAdmin, (req, res) => {
   const bookingId = Number(req.params.id);
   const { admin_note } = req.body;
 
-  // หา admin id
   db.get(
     "SELECT id FROM users WHERE line_user_id = ?",
     [req.user.lineUserId],
@@ -418,7 +442,6 @@ app.post("/admin/bookings/:id/approve", auth, requireAdmin, (req, res) => {
       if (err) return res.status(500).json({ error: err.message });
       if (!adminRow) return res.status(401).json({ error: "admin user not found" });
 
-      // update สถานะ + ใส่ admin
       db.run(
         `UPDATE bookings
          SET status='APPROVED', admin_id=?, admin_note=?
@@ -463,12 +486,12 @@ app.post("/admin/bookings/:id/reject", auth, requireAdmin, (req, res) => {
 
 // ====== Super Admin: User management ======
 
-// list users (สำหรับตั้ง role)
 app.get("/admin/users", auth, requireSuperAdmin, (req, res) => {
   const q = (req.query.q || "").trim();
 
   const baseSql = `
-    SELECT id, line_user_id, display_name, first_name, last_name, department, role, profile_completed, updated_at
+    SELECT id, line_user_id, display_name, first_name, last_name,
+           department, role, profile_completed, updated_at
     FROM users
   `;
 
@@ -484,10 +507,9 @@ app.get("/admin/users", auth, requireSuperAdmin, (req, res) => {
   });
 });
 
-// set role ให้ user คนอื่น
 app.post("/admin/users/:id/role", auth, requireSuperAdmin, (req, res) => {
   const userId = Number(req.params.id);
-  const role = (req.body.role || "").toUpperCase();
+  const role = String(req.body.role || "").toUpperCase();
 
   const allowed = new Set(["USER", "ADMIN", "SUPERADMIN"]);
   if (!allowed.has(role)) return res.status(400).json({ error: "invalid role" });
@@ -502,7 +524,6 @@ app.post("/admin/users/:id/role", auth, requireSuperAdmin, (req, res) => {
     }
   );
 });
-
 
 // ✅ listen แค่ครั้งเดียว
 app.listen(PORT, () => {
