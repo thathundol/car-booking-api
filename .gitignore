@@ -3,4 +3,8 @@ node_modules
 db.sqlite
 *.sqlite
 *.sqlite3
+*.sqlite-journal
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
 .DS_Store
