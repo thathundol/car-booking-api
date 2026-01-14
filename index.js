@@ -22,7 +22,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// ✅ Department allowlist (ตามที่คุณให้มา)
+// ✅ Department allowlist
 const DEPARTMENTS = [
   "ENGINEER",
   "ACCOUNT",
@@ -31,30 +31,139 @@ const DEPARTMENTS = [
   "PUBLIC_RELATIONS",
   "PURCHASING",
   "EXECUTIVE_GROUP",
+  "IT",
 ];
 
-function normalizeDepartment(input) {
-  const v = String(input || "").trim();
-  if (!v) return "";
-  const upper = v.toUpperCase();
+// ====== Helpers ======
+function nowISO() {
+  return new Date().toISOString();
+}
 
-  // รองรับกรณีพิมพ์ชื่อสวย ๆ เข้ามา (เผื่อ frontend ส่ง label)
+function bootstrapSuperAdmin(lineUserId) {
+  if (!BOOTSTRAP_SUPERADMIN_LINE_ID) return;
+  if (lineUserId !== BOOTSTRAP_SUPERADMIN_LINE_ID) return;
+
+  db.run(
+    `UPDATE users
+     SET role='SUPERADMIN', updated_at=?
+     WHERE line_user_id=? AND role!='SUPERADMIN'`,
+    [nowISO(), lineUserId],
+    (err) => {
+      if (err) console.error("❌ bootstrap SUPERADMIN error:", err.message);
+      else console.log("👑 SUPERADMIN ensured for", lineUserId);
+    }
+  );
+}
+
+// base64url decode ให้ถูก + padding
+function base64UrlDecode(str) {
+  let s = String(str || "").replace(/-/g, "+").replace(/_/g, "/");
+  const pad = s.length % 4;
+  if (pad) s += "=".repeat(4 - pad);
+  return Buffer.from(s, "base64").toString("utf8");
+}
+
+// MVP: decode อย่างเดียว (ยังไม่ verify signature)
+function decodeIdTokenUnsafe(idToken) {
+  const parts = String(idToken || "").split(".");
+  if (parts.length !== 3) throw new Error("Invalid idToken");
+  const payloadJson = base64UrlDecode(parts[1]);
+  return JSON.parse(payloadJson);
+}
+
+function signAppToken(lineUserId) {
+  return jwt.sign({ lineUserId }, APP_JWT_SECRET, { expiresIn: "7d" });
+}
+
+function auth(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "missing token" });
+
+  try {
+    const decoded = jwt.verify(token, APP_JWT_SECRET);
+    req.user = decoded; // { lineUserId }
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "invalid token" });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  db.get(
+    "SELECT role FROM users WHERE line_user_id = ?",
+    [req.user.lineUserId],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!row) return res.status(401).json({ error: "user not found" });
+      if (row.role !== "ADMIN" && row.role !== "SUPERADMIN") {
+        return res.status(403).json({ error: "admin only" });
+      }
+      next();
+    }
+  );
+}
+
+function requireSuperAdmin(req, res, next) {
+  db.get(
+    "SELECT role FROM users WHERE line_user_id = ?",
+    [req.user.lineUserId],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!row) return res.status(401).json({ error: "user not found" });
+      if (row.role !== "SUPERADMIN") {
+        return res.status(403).json({ error: "superadmin only" });
+      }
+      next();
+    }
+  );
+}
+
+// ✅ normalize department (รองรับ space/underscore/เคส)
+function normalizeDepartment(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return "";
+
+  // ทำให้รูปแบบเป็นตัวใหญ่ + เปลี่ยน _ เป็น space เพื่อ map ง่าย
+  const upper = raw.toUpperCase();
+  const spaced = upper.replace(/_/g, " ").replace(/\s+/g, " ").trim();
+
   const map = new Map([
     ["ENGINEER", "ENGINEER"],
+
     ["ACCOUNT", "ACCOUNT"],
+
     ["HUMAN RESOURCES", "HUMAN_RESOURCES"],
-    ["HUMAN_RESOURCES", "HUMAN_RESOURCES"],
     ["HR", "HUMAN_RESOURCES"],
+
     ["SALES", "SALES"],
+
     ["PUBLIC RELATIONS", "PUBLIC_RELATIONS"],
-    ["PUBLIC_RELATIONS", "PUBLIC_RELATIONS"],
     ["PR", "PUBLIC_RELATIONS"],
+
     ["PURCHASING", "PURCHASING"],
+
     ["EXECUTIVE GROUP", "EXECUTIVE_GROUP"],
-    ["EXECUTIVE_GROUP", "EXECUTIVE_GROUP"],
+
+    ["IT", "IT"],
+    ["INFORMATION TECHNOLOGY", "IT"],
+    ["INFORMATION_TECHNOLOGY", "IT"],
+    ["INFO TECH", "IT"],
+    ["IT DEPT", "IT"],
   ]);
 
-  return map.get(upper) || upper;
+  // ถ้า map เจอ ใช้ค่ามาตรฐาน
+  const mapped = map.get(spaced);
+  if (mapped) return mapped;
+
+  // fallback: ถ้า user ส่งมาเป็นรูปแบบมาตรฐานอยู่แล้ว เช่น EXECUTIVE_GROUP
+  // ก็คืนค่าเดิม แต่ normalize เป็น underscore
+  return upper.replace(/\s+/g, "_");
+}
+
+function isIsoLike(s) {
+  // เช็คแบบเบา ๆ กัน null/แปลก ๆ (ไม่ strict เกินไป)
+  return typeof s === "string" && s.length >= 10 && !Number.isNaN(Date.parse(s));
 }
 
 // ====== MIDDLEWARE ======
@@ -64,8 +173,8 @@ app.use(express.json());
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
-      if (ALLOWED_ORIGINS.length === 0) return callback(null, true);
+      if (!origin) return callback(null, true); // curl/postman
+      if (ALLOWED_ORIGINS.length === 0) return callback(null, true); // dev mode
       if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
       return callback(new Error(`CORS blocked for origin: ${origin}`));
     },
@@ -127,6 +236,7 @@ db.serialize(() => {
       admin_id INTEGER,
       admin_note TEXT,
       created_at TEXT,
+      updated_at TEXT,
 
       FOREIGN KEY(user_id) REFERENCES users(id),
       FOREIGN KEY(car_id) REFERENCES cars(id),
@@ -147,91 +257,6 @@ db.serialize(() => {
     }
   });
 });
-
-// ====== Helpers ======
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function bootstrapSuperAdmin(lineUserId) {
-  if (!BOOTSTRAP_SUPERADMIN_LINE_ID) return;
-  if (lineUserId !== BOOTSTRAP_SUPERADMIN_LINE_ID) return;
-
-  db.run(
-    `UPDATE users
-     SET role='SUPERADMIN', updated_at=?
-     WHERE line_user_id=? AND role!='SUPERADMIN'`,
-    [nowISO(), lineUserId],
-    (err) => {
-      if (err) console.error("❌ bootstrap SUPERADMIN error:", err.message);
-      else console.log("👑 SUPERADMIN ensured for", lineUserId);
-    }
-  );
-}
-
-// base64url decode ให้ถูก + padding
-function base64UrlDecode(str) {
-  let s = str.replace(/-/g, "+").replace(/_/g, "/");
-  const pad = s.length % 4;
-  if (pad) s += "=".repeat(4 - pad);
-  return Buffer.from(s, "base64").toString("utf8");
-}
-
-// MVP: decode อย่างเดียว (ยังไม่ verify signature)
-function decodeIdTokenUnsafe(idToken) {
-  const parts = idToken.split(".");
-  if (parts.length !== 3) throw new Error("Invalid idToken");
-  const payloadJson = base64UrlDecode(parts[1]);
-  return JSON.parse(payloadJson);
-}
-
-function signAppToken(lineUserId) {
-  return jwt.sign({ lineUserId }, APP_JWT_SECRET, { expiresIn: "7d" });
-}
-
-function auth(req, res, next) {
-  const h = req.headers.authorization || "";
-  const token = h.startsWith("Bearer ") ? h.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "missing token" });
-
-  try {
-    const decoded = jwt.verify(token, APP_JWT_SECRET);
-    req.user = decoded; // { lineUserId }
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: "invalid token" });
-  }
-}
-
-function requireAdmin(req, res, next) {
-  db.get(
-    "SELECT role FROM users WHERE line_user_id = ?",
-    [req.user.lineUserId],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!row) return res.status(401).json({ error: "user not found" });
-      if (row.role !== "ADMIN" && row.role !== "SUPERADMIN") {
-        return res.status(403).json({ error: "admin only" });
-      }
-      next();
-    }
-  );
-}
-
-function requireSuperAdmin(req, res, next) {
-  db.get(
-    "SELECT role FROM users WHERE line_user_id = ?",
-    [req.user.lineUserId],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!row) return res.status(401).json({ error: "user not found" });
-      if (row.role !== "SUPERADMIN") {
-        return res.status(403).json({ error: "superadmin only" });
-      }
-      next();
-    }
-  );
-}
 
 // ====== Routes ======
 app.get("/", (req, res) => res.send("OK"));
@@ -267,7 +292,7 @@ app.post("/auth/line", (req, res) => {
       (err) => {
         if (err) return res.status(500).json({ error: err.message });
 
-        // ✅ bootstrap SUPERADMIN ตรงนี้เท่านั้น (หลังรู้ lineUserId แน่นอน)
+        // ✅ bootstrap SUPERADMIN หลังรู้ lineUserId ชัวร์
         bootstrapSuperAdmin(lineUserId);
 
         db.get(
@@ -321,6 +346,7 @@ app.post("/me/profile", auth, (req, res) => {
     return res.status(400).json({
       error: "invalid department",
       allowed: DEPARTMENTS,
+      got: department,
     });
   }
 
@@ -339,8 +365,10 @@ app.post("/me/profile", auth, (req, res) => {
 
 // 4) Available cars
 app.get("/cars/available", auth, (req, res) => {
-  const { startAt, endAt } = req.query;
+  const startAt = String(req.query.startAt || "");
+  const endAt = String(req.query.endAt || "");
   if (!startAt || !endAt) return res.status(400).json({ error: "startAt & endAt required" });
+  if (!isIsoLike(startAt) || !isIsoLike(endAt)) return res.status(400).json({ error: "startAt/endAt must be ISO date string" });
 
   const sql = `
     SELECT c.*
@@ -363,10 +391,15 @@ app.get("/cars/available", auth, (req, res) => {
 
 // 5) Create booking
 app.post("/bookings", auth, (req, res) => {
-  const { carId, startAt, endAt, purpose } = req.body;
+  const carId = Number(req.body.carId);
+  const startAt = String(req.body.startAt || "");
+  const endAt = String(req.body.endAt || "");
+  const purpose = String(req.body.purpose || "");
+
   if (!carId || !startAt || !endAt) {
     return res.status(400).json({ error: "carId,startAt,endAt required" });
   }
+  if (!isIsoLike(startAt) || !isIsoLike(endAt)) return res.status(400).json({ error: "startAt/endAt must be ISO date string" });
 
   db.get(
     `SELECT id, profile_completed FROM users WHERE line_user_id = ?`,
@@ -379,6 +412,7 @@ app.post("/bookings", auth, (req, res) => {
         return res.status(403).json({ error: "profile not completed" });
       }
 
+      // กันจองซ้อน
       db.get(
         `SELECT id FROM bookings
          WHERE car_id=?
@@ -391,9 +425,9 @@ app.post("/bookings", auth, (req, res) => {
           if (conflict) return res.status(409).json({ error: "time conflict" });
 
           db.run(
-            `INSERT INTO bookings (user_id, car_id, start_at, end_at, purpose, status, created_at)
-             VALUES (?,?,?,?,?,'PENDING_APPROVAL',?)`,
-            [userRow.id, carId, startAt, endAt, purpose || "", nowISO()],
+            `INSERT INTO bookings (user_id, car_id, start_at, end_at, purpose, status, created_at, updated_at)
+             VALUES (?,?,?,?,?,'PENDING_APPROVAL',?,?)`,
+            [userRow.id, carId, startAt, endAt, purpose, nowISO(), nowISO()],
             function (err3) {
               if (err3) return res.status(500).json({ error: err3.message });
               return res.json({ bookingId: this.lastID, status: "PENDING_APPROVAL" });
@@ -406,10 +440,14 @@ app.post("/bookings", auth, (req, res) => {
 });
 
 // ====== Admin Dashboard APIs ======
+const BOOKING_STATUSES = new Set(["PENDING_APPROVAL", "APPROVED", "REJECTED", "CANCELLED"]);
 
-// 6) List pending bookings
+// 6) List bookings by status
 app.get("/admin/bookings", auth, requireAdmin, (req, res) => {
-  const status = (req.query.status || "PENDING_APPROVAL").toUpperCase();
+  const status = String(req.query.status || "PENDING_APPROVAL").toUpperCase();
+  if (!BOOKING_STATUSES.has(status)) {
+    return res.status(400).json({ error: "invalid status", allowed: Array.from(BOOKING_STATUSES) });
+  }
 
   const sql = `
     SELECT
@@ -430,64 +468,62 @@ app.get("/admin/bookings", auth, requireAdmin, (req, res) => {
   });
 });
 
+// helper: get admin id
+function getAdminId(lineUserId, cb) {
+  db.get("SELECT id FROM users WHERE line_user_id = ?", [lineUserId], (err, row) => {
+    if (err) return cb(err);
+    if (!row) return cb(new Error("admin user not found"));
+    cb(null, row.id);
+  });
+}
+
 // 7) Approve
 app.post("/admin/bookings/:id/approve", auth, requireAdmin, (req, res) => {
   const bookingId = Number(req.params.id);
-  const { admin_note } = req.body;
+  const admin_note = String(req.body.admin_note || "");
 
-  db.get(
-    "SELECT id FROM users WHERE line_user_id = ?",
-    [req.user.lineUserId],
-    (err, adminRow) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!adminRow) return res.status(401).json({ error: "admin user not found" });
+  getAdminId(req.user.lineUserId, (err, adminId) => {
+    if (err) return res.status(401).json({ error: err.message });
 
-      db.run(
-        `UPDATE bookings
-         SET status='APPROVED', admin_id=?, admin_note=?
-         WHERE id=? AND status='PENDING_APPROVAL'`,
-        [adminRow.id, admin_note || "", bookingId],
-        function (err2) {
-          if (err2) return res.status(500).json({ error: err2.message });
-          if (this.changes === 0) return res.status(404).json({ error: "not found or not pending" });
-          return res.json({ ok: true });
-        }
-      );
-    }
-  );
+    db.run(
+      `UPDATE bookings
+       SET status='APPROVED', admin_id=?, admin_note=?, updated_at=?
+       WHERE id=? AND status='PENDING_APPROVAL'`,
+      [adminId, admin_note, nowISO(), bookingId],
+      function (err2) {
+        if (err2) return res.status(500).json({ error: err2.message });
+        if (this.changes === 0) return res.status(404).json({ error: "not found or not pending" });
+        return res.json({ ok: true });
+      }
+    );
+  });
 });
 
 // 8) Reject
 app.post("/admin/bookings/:id/reject", auth, requireAdmin, (req, res) => {
   const bookingId = Number(req.params.id);
-  const { admin_note } = req.body;
+  const admin_note = String(req.body.admin_note || "");
 
-  db.get(
-    "SELECT id FROM users WHERE line_user_id = ?",
-    [req.user.lineUserId],
-    (err, adminRow) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!adminRow) return res.status(401).json({ error: "admin user not found" });
+  getAdminId(req.user.lineUserId, (err, adminId) => {
+    if (err) return res.status(401).json({ error: err.message });
 
-      db.run(
-        `UPDATE bookings
-         SET status='REJECTED', admin_id=?, admin_note=?
-         WHERE id=? AND status='PENDING_APPROVAL'`,
-        [adminRow.id, admin_note || "", bookingId],
-        function (err2) {
-          if (err2) return res.status(500).json({ error: err2.message });
-          if (this.changes === 0) return res.status(404).json({ error: "not found or not pending" });
-          return res.json({ ok: true });
-        }
-      );
-    }
-  );
+    db.run(
+      `UPDATE bookings
+       SET status='REJECTED', admin_id=?, admin_note=?, updated_at=?
+       WHERE id=? AND status='PENDING_APPROVAL'`,
+      [adminId, admin_note, nowISO(), bookingId],
+      function (err2) {
+        if (err2) return res.status(500).json({ error: err2.message });
+        if (this.changes === 0) return res.status(404).json({ error: "not found or not pending" });
+        return res.json({ ok: true });
+      }
+    );
+  });
 });
 
 // ====== Super Admin: User management ======
-
 app.get("/admin/users", auth, requireSuperAdmin, (req, res) => {
-  const q = (req.query.q || "").trim();
+  const q = String(req.query.q || "").trim();
 
   const baseSql = `
     SELECT id, line_user_id, display_name, first_name, last_name,
@@ -496,7 +532,9 @@ app.get("/admin/users", auth, requireSuperAdmin, (req, res) => {
   `;
 
   const sql = q
-    ? baseSql + ` WHERE display_name LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR department LIKE ? ORDER BY updated_at DESC LIMIT 200`
+    ? baseSql +
+      ` WHERE display_name LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR department LIKE ?
+        ORDER BY updated_at DESC LIMIT 200`
     : baseSql + ` ORDER BY updated_at DESC LIMIT 200`;
 
   const params = q ? Array(4).fill(`%${q}%`) : [];

@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Super Admin - User Roles</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    .row { display:flex; gap:10px; flex-wrap: wrap; align-items:center; }
+    .card { border:1px solid #ddd; border-radius: 12px; padding: 12px; margin: 12px 0; }
+    input, select, button { padding: 8px; }
+    button { cursor:pointer; }
+    table { width:100%; border-collapse: collapse; margin-top:10px; }
+    th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }
+    .muted { color:#666; }
+    .danger { color:#b00020; }
+    .ok { color:#0a7; }
+    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius: 999px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h2>Admin Dashboard (Super Admin)</h2>
+
+  <div class="card">
+    <div class="row">
+      <div class="muted">API Base:</div>
+      <input id="apiBase" style="min-width:360px" placeholder="https://car-booking-api-docker.onrender.com" />
+      <button onclick="saveApiBase()">Save</button>
+      <button onclick="refreshAll()">Refresh</button>
+    </div>
+    <div class="muted" style="margin-top:6px">
+      ต้องมี <b>appToken</b> ใน localStorage key: <code>cb_app_token</code>
+    </div>
+  </div>
+
+  <div class="card">
+    <b>ผู้ใช้ที่กำลังล็อกอิน</b>
+    <div id="meBox" class="muted">กำลังโหลด...</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <b>จัดการผู้ใช้</b>
+      <input id="q" placeholder="ค้นหา ชื่อ/นามสกุล/แผนก" />
+      <button onclick="loadUsers()">Search</button>
+      <span class="muted">* ใช้งานได้เฉพาะ SUPERADMIN</span>
+    </div>
+    <div id="usersBox" class="muted" style="margin-top:8px">ยังไม่ได้โหลด</div>
+  </div>
+
+<script>
+  const LS_API = "cb_api_base";
+  const LS_TOKEN = "cb_app_token";
+
+  function base() {
+    return (document.getElementById("apiBase").value || "").trim().replace(/\/+$/, "");
+  }
+  function token() {
+    return localStorage.getItem(LS_TOKEN) || "";
+  }
+  function saveApiBase() {
+    localStorage.setItem(LS_API, base());
+    alert("Saved API base");
+  }
+
+  async function api(path, opts = {}) {
+    const b = base();
+    if (!b) throw new Error("Missing API base URL");
+    const t = token();
+    if (!t) throw new Error("Missing cb_app_token in localStorage");
+
+    const res = await fetch(b + path, {
+      ...opts,
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + t,
+        ...(opts.headers || {})
+      }
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    return data;
+  }
+
+  async function loadMe() {
+    const el = document.getElementById("meBox");
+    el.textContent = "กำลังโหลด...";
+    try {
+      // ต้องมี endpoint /me (ถ้าไม่มี บอกผม เดี๋ยวให้โค้ด)
+      const data = await api("/me");
+      const u = data.user || data;
+      el.innerHTML = `
+        <div><b>${(u.first_name||"") + " " + (u.last_name||"")}</b> <span class="pill">${u.role||"-"}</span></div>
+        <div class="muted">display: ${u.display_name||"-"} | dept: ${u.department||"-"}</div>
+        <div class="muted">line_user_id: <code>${u.line_user_id || u.lineUserId || "-"}</code></div>
+      `;
+      return u;
+    } catch (e) {
+      el.innerHTML = `<span class="danger">${e.message}</span>`;
+    }
+  }
+
+  function esc(s){ return (s??"").toString().replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+  function renderUsers(users) {
+    if (!users.length) return `<div class="muted">ไม่พบผู้ใช้</div>`;
+
+    const rows = users.map(u => `
+      <tr>
+        <td>${u.id}</td>
+        <td>
+          <b>${esc((u.first_name||"") + " " + (u.last_name||""))}</b>
+          <div class="muted">display: ${esc(u.display_name||"-")}</div>
+          <div class="muted"><code>${esc(u.line_user_id||"-")}</code></div>
+        </td>
+        <td>${esc(u.department||"-")}</td>
+        <td><span class="pill">${esc(u.role||"USER")}</span></td>
+        <td>
+          <select id="role_${u.id}">
+            <option value="USER" ${u.role==="USER"?"selected":""}>USER</option>
+            <option value="ADMIN" ${u.role==="ADMIN"?"selected":""}>ADMIN</option>
+            <option value="SUPERADMIN" ${u.role==="SUPERADMIN"?"selected":""}>SUPERADMIN</option>
+          </select>
+          <button onclick="setRole(${u.id})">Save</button>
+        </td>
+      </tr>
+    `).join("");
+
+    return `
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>ชื่อ</th><th>แผนก</th><th>Role</th><th>ปรับ Role</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  }
+
+  async function loadUsers() {
+    const el = document.getElementById("usersBox");
+    el.textContent = "กำลังโหลด...";
+    try {
+      const q = (document.getElementById("q").value || "").trim();
+      const data = await api("/admin/users" + (q ? `?q=${encodeURIComponent(q)}` : ""));
+      el.innerHTML = renderUsers(data.users || []);
+    } catch (e) {
+      el.innerHTML = `<span class="danger">${e.message}</span>`;
+    }
+  }
+
+  async function setRole(id) {
+    const sel = document.getElementById("role_" + id);
+    const role = sel.value;
+
+    if (!confirm(`ยืนยันตั้ง role เป็น ${role} สำหรับ user id=${id}?`)) return;
+
+    try {
+      await api(`/admin/users/${id}/role`, {
+        method: "POST",
+        body: JSON.stringify({ role })
+      });
+      alert("Updated role: " + role);
+      loadUsers();
+    } catch (e) {
+      alert(e.message);
+    }
+  }
+
+  async function refreshAll() {
+    await loadMe();
+    await loadUsers();
+  }
+
+  // init
+  (function init(){
+    document.getElementById("apiBase").value = localStorage.getItem(LS_API) || "";
+    refreshAll();
+  })();
+</script>
+</body>
+</html>
