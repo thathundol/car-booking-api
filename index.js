@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const sqlite3 = require("sqlite3").verbose();
+const https = require("https");
 
 const BOOTSTRAP_SUPERADMIN_LINE_ID =
   process.env.BOOTSTRAP_SUPERADMIN_LINE_ID || "";
@@ -55,20 +56,46 @@ function bootstrapSuperAdmin(lineUserId) {
   );
 }
 
-// base64url decode ให้ถูก + padding
-function base64UrlDecode(str) {
-  let s = String(str || "").replace(/-/g, "+").replace(/_/g, "/");
-  const pad = s.length % 4;
-  if (pad) s += "=".repeat(4 - pad);
-  return Buffer.from(s, "base64").toString("utf8");
-}
+// ✅ verify idToken กับ LINE จริง (ปลอดภัยกว่า decode เฉย ๆ)
+function verifyLineIdToken(idToken) {
+  return new Promise((resolve, reject) => {
+    const postData = new URLSearchParams({
+      id_token: idToken,
+      client_id: LINE_CHANNEL_ID,
+    }).toString();
 
-// MVP: decode อย่างเดียว (ยังไม่ verify signature)
-function decodeIdTokenUnsafe(idToken) {
-  const parts = String(idToken || "").split(".");
-  if (parts.length !== 3) throw new Error("Invalid idToken");
-  const payloadJson = base64UrlDecode(parts[1]);
-  return JSON.parse(payloadJson);
+    const options = {
+      hostname: "api.line.me",
+      path: "/oauth2/v2.1/verify",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(postData),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let raw = "";
+      res.on("data", (chunk) => (raw += chunk));
+      res.on("end", () => {
+        try {
+          const data = JSON.parse(raw || "{}");
+          if (res.statusCode !== 200) {
+            return reject(
+              new Error(data.error_description || data.error || "verify failed")
+            );
+          }
+          return resolve(data);
+        } catch (e) {
+          return reject(new Error("verify parse error"));
+        }
+      });
+    });
+
+    req.on("error", (e) => reject(e));
+    req.write(postData);
+    req.end();
+  });
 }
 
 function signAppToken(lineUserId) {
@@ -124,7 +151,6 @@ function normalizeDepartment(input) {
   const raw = String(input || "").trim();
   if (!raw) return "";
 
-  // ทำให้รูปแบบเป็นตัวใหญ่ + เปลี่ยน _ เป็น space เพื่อ map ง่าย
   const upper = raw.toUpperCase();
   const spaced = upper.replace(/_/g, " ").replace(/\s+/g, " ").trim();
 
@@ -152,17 +178,13 @@ function normalizeDepartment(input) {
     ["IT DEPT", "IT"],
   ]);
 
-  // ถ้า map เจอ ใช้ค่ามาตรฐาน
   const mapped = map.get(spaced);
   if (mapped) return mapped;
 
-  // fallback: ถ้า user ส่งมาเป็นรูปแบบมาตรฐานอยู่แล้ว เช่น EXECUTIVE_GROUP
-  // ก็คืนค่าเดิม แต่ normalize เป็น underscore
   return upper.replace(/\s+/g, "_");
 }
 
 function isIsoLike(s) {
-  // เช็คแบบเบา ๆ กัน null/แปลก ๆ (ไม่ strict เกินไป)
   return typeof s === "string" && s.length >= 10 && !Number.isNaN(Date.parse(s));
 }
 
@@ -262,18 +284,23 @@ db.serialize(() => {
 app.get("/", (req, res) => res.send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true, time: nowISO() }));
 
-// 1) Auth with LINE idToken
-app.post("/auth/line", (req, res) => {
+// 1) Auth with LINE idToken (✅ verify กับ LINE จริง)
+app.post("/auth/line", async (req, res) => {
   try {
     const { idToken } = req.body;
     if (!idToken) return res.status(400).json({ error: "idToken required" });
 
-    const payload = decodeIdTokenUnsafe(idToken);
+    if (!LINE_CHANNEL_ID) {
+      return res.status(500).json({ error: "LINE_CHANNEL_ID not set" });
+    }
+
+    const payload = await verifyLineIdToken(idToken);
 
     console.log("[/auth/line] sub:", payload.sub, "aud:", payload.aud);
 
     if (!payload.sub) return res.status(400).json({ error: "token missing sub" });
-    if (LINE_CHANNEL_ID && payload.aud !== LINE_CHANNEL_ID) {
+    // LINE verify ควรจะตรวจ aud ให้แล้ว แต่เช็คซ้ำอีกชั้น
+    if (LINE_CHANNEL_ID && String(payload.aud) !== String(LINE_CHANNEL_ID)) {
       return res.status(401).json({ error: "aud mismatch" });
     }
 
@@ -519,6 +546,78 @@ app.post("/admin/bookings/:id/reject", auth, requireAdmin, (req, res) => {
       }
     );
   });
+});
+
+// ====== Admin: Cars management (✅ เพิ่มให้ใช้งานจริง) ======
+app.get("/admin/cars", auth, requireAdmin, (req, res) => {
+  db.all(
+    `SELECT id, name, plate, seats, image_url, active
+     FROM cars
+     ORDER BY id DESC
+     LIMIT 500`,
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      return res.json({ cars: rows });
+    }
+  );
+});
+
+app.post("/admin/cars", auth, requireAdmin, (req, res) => {
+  const name = String(req.body.name || "").trim();
+  const plate = String(req.body.plate || "").trim();
+  const seats = Number(req.body.seats || 0);
+  const image_url = String(req.body.image_url || "").trim();
+
+  if (!name || !plate || !seats) {
+    return res.status(400).json({ error: "name, plate, seats required" });
+  }
+
+  db.run(
+    `INSERT INTO cars (name, plate, seats, image_url, active)
+     VALUES (?,?,?,?,1)`,
+    [name, plate, seats, image_url],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      return res.json({ ok: true, carId: this.lastID });
+    }
+  );
+});
+
+app.put("/admin/cars/:id", auth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const name = String(req.body.name || "").trim();
+  const plate = String(req.body.plate || "").trim();
+  const seats = Number(req.body.seats || 0);
+  const image_url = String(req.body.image_url || "").trim();
+
+  if (!id || !name || !plate || !seats) {
+    return res.status(400).json({ error: "id, name, plate, seats required" });
+  }
+
+  db.run(
+    `UPDATE cars SET name=?, plate=?, seats=?, image_url=? WHERE id=?`,
+    [name, plate, seats, image_url, id],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(404).json({ error: "car not found" });
+      return res.json({ ok: true });
+    }
+  );
+});
+
+app.patch("/admin/cars/:id/active", auth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const active = req.body.active ? 1 : 0;
+
+  db.run(
+    `UPDATE cars SET active=? WHERE id=?`,
+    [active, id],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(404).json({ error: "car not found" });
+      return res.json({ ok: true, active });
+    }
+  );
 });
 
 // ====== Super Admin: User management ======
